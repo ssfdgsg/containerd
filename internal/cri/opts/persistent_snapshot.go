@@ -19,8 +19,10 @@ package opts
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -28,6 +30,15 @@ import (
 )
 
 const persistImageDigestLabel = "persist.containerd.dev/image-digest"
+const persistRuntimeKeyPrefix = "persist/"
+const persistImportKeyPrefix = "persist-import/"
+
+func persistentImportedSnapshotKey(runtimeKey string) (string, bool) {
+	if !strings.HasPrefix(runtimeKey, persistRuntimeKeyPrefix) {
+		return "", false
+	}
+	return persistImportKeyPrefix + strings.TrimPrefix(runtimeKey, persistRuntimeKeyPrefix), true
+}
 
 // WithPersistentSnapshot reuses a named writable snapshot if it already exists,
 // otherwise it creates it from the supplied image.
@@ -38,22 +49,40 @@ func WithPersistentSnapshot(id string, i containerd.Image, expectedImageRef stri
 		}
 
 		snapshotter := client.SnapshotService(c.Snapshotter)
+		log.G(ctx).Infof("persistent snapshot requested key=%s snapshotter=%s", id, c.Snapshotter)
+
+		checkImageRef := func(key string, info snapshots.Info) error {
+			if expectedImageRef == "" {
+				return nil
+			}
+			got := ""
+			if info.Labels != nil {
+				got = info.Labels[persistImageDigestLabel]
+			}
+			if got != expectedImageRef {
+				return fmt.Errorf("persistent snapshot %q was created for image %q, not %q: %w", key, got, expectedImageRef, errdefs.ErrFailedPrecondition)
+			}
+			return nil
+		}
+
 		info, err := snapshotter.Stat(ctx, id)
 		if err == nil {
-			if expectedImageRef != "" {
-				got := ""
-				if info.Labels != nil {
-					got = info.Labels[persistImageDigestLabel]
-				}
-				if got != expectedImageRef {
-					return fmt.Errorf("persistent snapshot %q was created for image %q, not %q: %w", id, got, expectedImageRef, errdefs.ErrFailedPrecondition)
-				}
-			}
-			if err := containerd.WithSnapshot(id)(ctx, client, c); err != nil {
+			log.G(ctx).Infof("persistent snapshot stat key=%s kind=%s parent=%s", id, info.Kind, info.Parent)
+			if err := checkImageRef(id, info); err != nil {
 				return err
 			}
-			c.Image = i.Name()
-			return nil
+			switch info.Kind {
+			case snapshots.KindActive, snapshots.KindView:
+				if err := containerd.WithSnapshot(id)(ctx, client, c); err != nil {
+					return err
+				}
+				c.Image = i.Name()
+				return nil
+			case snapshots.KindCommitted:
+				return fmt.Errorf("persistent snapshot %q exists as committed snapshot and cannot be used directly as runtime writable rootfs; import into %q instead: %w", id, persistImportKeyPrefix+strings.TrimPrefix(id, persistRuntimeKeyPrefix), errdefs.ErrFailedPrecondition)
+			default:
+				return fmt.Errorf("persistent snapshot %q has unsupported kind %s for runtime reuse: %w", id, info.Kind, errdefs.ErrFailedPrecondition)
+			}
 		}
 		if !errdefs.IsNotFound(err) {
 			return err
@@ -64,6 +93,31 @@ func WithPersistentSnapshot(id string, i containerd.Image, expectedImageRef stri
 			snapshotOpts = append(snapshotOpts, snapshots.WithLabels(labels))
 		}
 		snapshotOpts = append(snapshotOpts, opts...)
+
+		if importedKey, ok := persistentImportedSnapshotKey(id); ok {
+			importedInfo, importedErr := snapshotter.Stat(ctx, importedKey)
+			if importedErr == nil {
+				log.G(ctx).Infof("persistent imported base found key=%s kind=%s parent=%s", importedKey, importedInfo.Kind, importedInfo.Parent)
+				if importedInfo.Kind != snapshots.KindCommitted {
+					return fmt.Errorf("persistent imported base %q has kind %s, want committed: %w", importedKey, importedInfo.Kind, errdefs.ErrFailedPrecondition)
+				}
+				if err := checkImageRef(importedKey, importedInfo); err != nil {
+					return err
+				}
+				log.G(ctx).Infof("persistent snapshot prepare active key=%s parent=%s", id, importedKey)
+				if _, err := snapshotter.Prepare(ctx, id, importedKey, snapshotOpts...); err != nil {
+					return err
+				}
+				c.SnapshotKey = id
+				c.Image = i.Name()
+				return nil
+			}
+			if importedErr != nil && !errdefs.IsNotFound(importedErr) {
+				return importedErr
+			}
+		}
+
+		log.G(ctx).Infof("persistent snapshot fallback new image snapshot key=%s", id)
 		return WithNewSnapshot(id, i, appendSnapshotLabels, snapshotOpts...)(ctx, client, c)
 	}
 }

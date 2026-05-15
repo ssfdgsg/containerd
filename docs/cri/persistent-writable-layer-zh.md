@@ -131,12 +131,28 @@ persist/demo-rootfs-1-box
 - snapshot 不存在：
   - 基于镜像 rootfs 创建新的 writable snapshot
 - snapshot 已存在：
-  - 直接复用该 snapshot
+  - 如果是 active/view，则直接复用该 snapshot
+  - 如果是 committed，则拒绝直接作为运行时 writable rootfs 使用
 
 也就是说：
 
 - 首次运行时是“创建”
 - 后续重建时是“复用”
+
+如果节点上已经通过 node-agent 导入了一个只读基底 snapshot，则需要使用两层结构：
+
+```text
+persist-import/<persist-id>-<container-name>   # committed，只读导入基底
+persist/<persist-id>-<container-name>          # active，Pod 运行时 writable rootfs
+```
+
+CRI 创建容器时会按顺序判断：
+
+1. `persist/...` 已存在且是 active/view：直接复用
+2. `persist/...` 不存在，但 `persist-import/...` 存在且是 committed：执行 `Prepare(persist/..., persist-import/...)`
+3. 两者都不存在：基于镜像 rootfs 创建新的 active snapshot
+
+这保证了导入数据作为 parent 继承到运行时 rootfs 中，同时容器仍然获得一个可写的 active snapshot。
 
 ### 4. 删除容器时跳过持久 snapshot cleanup
 
